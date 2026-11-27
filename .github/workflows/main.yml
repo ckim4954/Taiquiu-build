@@ -5,7 +5,7 @@ on:
   push:
     branches: [main, master]
     paths:
-      - 'taiqiu_offline-vietnamese-github-ready.zip'
+      - 'taiqiu_offline-vietnamese*.zip'
       - '.github/workflows/build-apk.yml'
 
 permissions:
@@ -17,44 +17,66 @@ concurrency:
 
 jobs:
   build:
-    name: Unpack source and build APK
+    name: Build APK from uploaded source ZIP
     runs-on: ubuntu-24.04
     timeout-minutes: 45
 
     steps:
-      - name: Check out repository (contains the source ZIP)
+      - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Find and safely extract source ZIP
+      - name: Locate and safely extract Vietnamese source ZIP
         id: source
         shell: bash
         run: |
           set -euo pipefail
-          ZIP_FILE="taiqiu_offline-vietnamese-github-ready.zip"
-          test -s "$ZIP_FILE" || { echo "Missing $ZIP_FILE at repository root"; exit 1; }
+          mapfile -t archives < <(find . -maxdepth 1 -type f -name 'taiqiu_offline-vietnamese*.zip' -print)
+          if [ "${#archives[@]}" -ne 1 ]; then
+            printf 'Expected exactly one taiqiu_offline-vietnamese*.zip at repository root; found %s\n' "${#archives[@]}"
+            printf '%s\n' "${archives[@]}"
+            exit 1
+          fi
+          export SOURCE_ZIP="${archives[0]}"
           python3 - <<'PY'
-          import os, pathlib, zipfile
-          archive = pathlib.Path("taiqiu_offline-vietnamese-github-ready.zip")
-          destination = pathlib.Path("_build_source").resolve()
-          destination.mkdir(exist_ok=True)
+          import os
+          import pathlib
+          import zipfile
+
+          archive = pathlib.Path(os.environ['SOURCE_ZIP'])
+          destination = pathlib.Path('_build_source').resolve()
+          destination.mkdir(parents=True, exist_ok=True)
+
           with zipfile.ZipFile(archive) as zf:
               for item in zf.infolist():
                   target = (destination / item.filename).resolve()
                   if target != destination and destination not in target.parents:
-                      raise SystemExit(f"Unsafe path in ZIP: {item.filename}")
+                      raise SystemExit(f'Unsafe path in ZIP: {item.filename!r}')
               zf.extractall(destination)
-          matches = list(destination.rglob("billiards-cn/package-lock.json"))
+
+          matches = list(destination.rglob('billiards-cn/package-lock.json'))
           if len(matches) != 1:
-              raise SystemExit(f"Expected exactly one billiards-cn/package-lock.json, found {len(matches)}")
-          root = matches[0].parent.parent
-          root_relative = root.relative_to(pathlib.Path.cwd())
-          required = [root / "billiards-apk/build-apk.sh", root / "billiards-apk/AndroidManifest.xml", root / "billiards-cn/package.json"]
-          missing = [str(p) for p in required if not p.is_file()]
+              raise SystemExit(
+                  'Expected exactly one billiards-cn/package-lock.json; '
+                  f'found {len(matches)}'
+              )
+
+          project_root = matches[0].parent.parent
+          required = [
+              project_root / 'billiards-cn/package.json',
+              project_root / 'billiards-cn/webpack.config.js',
+              project_root / 'billiards-apk/build-apk.sh',
+              project_root / 'billiards-apk/AndroidManifest.xml',
+              project_root / 'billiards-apk/patch_manifest.py',
+              project_root / 'billiards-apk/pyzipalign.py',
+          ]
+          missing = [str(path) for path in required if not path.is_file()]
           if missing:
-              raise SystemExit("Missing required project files: " + ", ".join(missing))
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"root={root_relative}\n")
-          print(f"Project root: {root_relative}")
+              raise SystemExit('Missing required project files: ' + ', '.join(missing))
+
+          relative_root = project_root.relative_to(pathlib.Path.cwd())
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'root={relative_root.as_posix()}\n')
+          print(f'Project root: {relative_root}')
           PY
 
       - name: Set up Node.js
@@ -73,13 +95,13 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK packages
+      - name: Install Android SDK 34 build tools
         shell: bash
         run: |
           set -euo pipefail
           sdkmanager --install 'platform-tools' 'platforms;android-34' 'build-tools;34.0.0'
 
-      - name: Verify build tools and project inputs
+      - name: Verify build environment
         working-directory: ${{ steps.source.outputs.root }}
         shell: bash
         run: |
@@ -88,38 +110,68 @@ jobs:
           npm --version
           java -version
           python3 --version
+          test -s billiards-cn/package-lock.json
           test -f "$ANDROID_HOME/platforms/android-34/android.jar"
           for tool in aapt2 d8 apksigner zipalign; do
             test -x "$ANDROID_HOME/build-tools/34.0.0/$tool"
           done
-          test -s billiards-cn/package-lock.json
-          test -s billiards-cn/dist/menu.html
-          test -s billiards-cn/dist/index.js
-          test -s billiards-cn/dist/three_module.js
-          test -s billiards-cn/dist/three_core.js
-          test -s billiards-cn/dist/three_examples.js
+
+      - name: Install native libraries required by canvas
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev
 
       - name: Install frontend dependencies
         working-directory: ${{ steps.source.outputs.root }}/billiards-cn
         run: npm ci --no-audit --no-fund
 
-      - name: Build frontend
+      - name: Build frontend assets
         working-directory: ${{ steps.source.outputs.root }}/billiards-cn
         run: npm run build
+
+      - name: Verify frontend build outputs
+        working-directory: ${{ steps.source.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in menu.html index.js three_module.js three_core.js three_examples.js; do
+            test -s "billiards-cn/dist/$file" || {
+              echo "Missing frontend build output: billiards-cn/dist/$file"
+              exit 1
+            }
+          done
+          grep -q '__BILLIARDS_VERSION__' billiards-cn/dist/menu.html
 
       - name: Build and verify APK
         working-directory: ${{ steps.source.outputs.root }}/billiards-apk
         shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
           set -euo pipefail
           export ANDROID_SDK="$ANDROID_HOME"
-          export KS_PASS=android
+          export KEYSTORE=release.keystore
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            test -n "${ANDROID_KEYSTORE_PASSWORD:-}" || { echo 'ANDROID_KEYSTORE_PASSWORD secret is required with ANDROID_KEYSTORE_BASE64'; exit 1; }
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+            export KS_PASS="$ANDROID_KEYSTORE_PASSWORD"
+          else
+            # Fallback key is temporary and changes on each clean GitHub runner.
+            export KS_PASS=android
+          fi
           chmod +x ./build-apk.sh
           ./build-apk.sh
-          compgen -G 'billiards-vi-*.apk' >/dev/null
-          for apk in billiards-vi-*.apk; do
+          shopt -s nullglob
+          apks=(billiards-vi-*.apk)
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo 'Build script did not produce billiards-vi-*.apk'
+            exit 1
+          fi
+          for apk in "${apks[@]}"; do
             test -s "$apk"
             "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose "$apk"
+            echo "Verified APK: $apk"
           done
 
       - name: Upload APK artifact
