@@ -1,0 +1,131 @@
+name: Build Vietnamese APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'taiqiu_offline-vietnamese-github-ready.zip'
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vietnamese-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Unpack source and build APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository (contains the source ZIP)
+        uses: actions/checkout@v4
+
+      - name: Find and safely extract source ZIP
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP_FILE="taiqiu_offline-vietnamese-github-ready.zip"
+          test -s "$ZIP_FILE" || { echo "Missing $ZIP_FILE at repository root"; exit 1; }
+          python3 - <<'PY'
+          import os, pathlib, zipfile
+          archive = pathlib.Path("taiqiu_offline-vietnamese-github-ready.zip")
+          destination = pathlib.Path("_build_source").resolve()
+          destination.mkdir(exist_ok=True)
+          with zipfile.ZipFile(archive) as zf:
+              for item in zf.infolist():
+                  target = (destination / item.filename).resolve()
+                  if target != destination and destination not in target.parents:
+                      raise SystemExit(f"Unsafe path in ZIP: {item.filename}")
+              zf.extractall(destination)
+          matches = list(destination.rglob("billiards-cn/package-lock.json"))
+          if len(matches) != 1:
+              raise SystemExit(f"Expected exactly one billiards-cn/package-lock.json, found {len(matches)}")
+          root = matches[0].parent.parent
+          root_relative = root.relative_to(pathlib.Path.cwd())
+          required = [root / "billiards-apk/build-apk.sh", root / "billiards-apk/AndroidManifest.xml", root / "billiards-cn/package.json"]
+          missing = [str(p) for p in required if not p.is_file()]
+          if missing:
+              raise SystemExit("Missing required project files: " + ", ".join(missing))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"root={root_relative}\n")
+          print(f"Project root: {root_relative}")
+          PY
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ${{ steps.source.outputs.root }}/billiards-cn/package-lock.json
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install 'platform-tools' 'platforms;android-34' 'build-tools;34.0.0'
+
+      - name: Verify build tools and project inputs
+        working-directory: ${{ steps.source.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          npm --version
+          java -version
+          python3 --version
+          test -f "$ANDROID_HOME/platforms/android-34/android.jar"
+          for tool in aapt2 d8 apksigner zipalign; do
+            test -x "$ANDROID_HOME/build-tools/34.0.0/$tool"
+          done
+          test -s billiards-cn/package-lock.json
+          test -s billiards-cn/dist/menu.html
+          test -s billiards-cn/dist/index.js
+          test -s billiards-cn/dist/three_module.js
+          test -s billiards-cn/dist/three_core.js
+          test -s billiards-cn/dist/three_examples.js
+
+      - name: Install frontend dependencies
+        working-directory: ${{ steps.source.outputs.root }}/billiards-cn
+        run: npm ci --no-audit --no-fund
+
+      - name: Build frontend
+        working-directory: ${{ steps.source.outputs.root }}/billiards-cn
+        run: npm run build
+
+      - name: Build and verify APK
+        working-directory: ${{ steps.source.outputs.root }}/billiards-apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_SDK="$ANDROID_HOME"
+          export KS_PASS=android
+          chmod +x ./build-apk.sh
+          ./build-apk.sh
+          compgen -G 'billiards-vi-*.apk' >/dev/null
+          for apk in billiards-vi-*.apk; do
+            test -s "$apk"
+            "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose "$apk"
+          done
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: taiqiu-offline-vietnamese-apk
+          path: ${{ steps.source.outputs.root }}/billiards-apk/billiards-vi-*.apk
+          if-no-files-found: error
+          retention-days: 14
